@@ -1,0 +1,16 @@
+version: "2"
+linters:
+  default: standard
+  settings:
+    errcheck:
+      # Best-effort cleanup calls whose errors carry no useful information.
+      exclude-functions:
+        - (net.Conn).Close
+        - (net.Listener).Close
+        - (*net.TCPListener).SetDeadline
+        - (net.Conn).SetDeadline
+        - (net.Conn).SetReadDeadline
+        - (net.Conn).SetWriteDeadline
+        - (*bufio.Reader).ReadByte
+        - (io.Closer).Close
+        - io.Copy
