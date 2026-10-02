@@ -17,3 +17,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 - The example Docker Compose stack publishes its host port through `XDBG_EXAMPLE_PORT` (default `8888`) (#1)
+
+### Fixed
+- Malformed `tools/call` params now return a JSON-RPC `-32602` error instead of calling a tool named `""`; a failed write of a response to stdout is logged to stderr; a malformed DBGp init packet drops the connection and a malformed DBGp response is returned as an error instead of an empty response. The four `//nolint:errcheck` comments are gone (#2)
