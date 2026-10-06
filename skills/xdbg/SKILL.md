@@ -99,7 +99,7 @@ Never paste tokens into tool arguments. Use `request_from_files`:
 
 ## Flow 2: Debugging a CLI Command (agent-driven — `run_command`)
 
-Best for: Symfony console commands, artisan commands, or any CLI entrypoint that runs with the `--container-exec` prefix (default `docker compose exec -T php`) followed by `<command>`.`
+Best for: Symfony console commands, artisan commands, or any CLI entrypoint that runs with the `--container-exec` prefix (default `docker compose exec -T php`) followed by `<command>`.
 
 ### Example — Symfony console command
 

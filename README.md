@@ -237,7 +237,8 @@ client adds a prefix: opencode shows `xdbg_status`, Claude Code shows
 ### `xdbg_status()`
 Returns the current debugger state (`no session`, `started`, `break`,
 `stopping`), the file and line where execution is paused (or `-` when not
-paused), and the number of breakpoints xdbg knows (queued and applied). The reply has three lines: state=…, location=…, breakpoints=N. Use it as the first call
+paused), and the number of breakpoints xdbg knows (queued and applied). The reply
+has three lines: `state=…`, `location=…`, `breakpoints=N`. Use it as the first call
 after firing a request or running a command to see whether the session was
 adopted and where the engine stopped. It's safe to call any time, with or
 without an active session. It does not advance execution or mutate state.
