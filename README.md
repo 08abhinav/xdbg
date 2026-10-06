@@ -34,7 +34,7 @@ plus CLI/Symfony command debugging and host↔container path translation.
 | **Auth / cookies / JWT** | Nowhere to put the header | Pass `headers: {"Authorization": "Bearer …"}` (or read from a file to keep secrets out of the chat) |
 | **CLI / Symfony commands** | No MCP path at all | `xdbg_run_command "bin/console app:foo"` pauses at the breakpoint |
 | **Host ↔ container paths** | Breakpoints need container paths; stacks show container paths | Set breakpoints with host paths; stacks come back as host paths |
-| **Port conflicts** | Two debuggers fight over 9003 | Detects the holder (lsof), waits its turn, tells you who's blocking |
+| **Port conflicts** | Two debuggers fight over 9003 | Detects the holder (lsof), waits up to 10 s for its turn, then tells you who's blocking |
 | **Port 9003 always busy** | Debugger holds the port all session | Binds only during a tool call (`xdbg_request`, `xdbg_run_command`, `xdbg_listen`); releases immediately after — PhpStorm, browser Xdebug, and other tools work freely between calls |
 
 ## How it works (30-second version)
@@ -77,7 +77,7 @@ For the full request round-trip with step-by-step sequence, see the
 >
 > The agent will read the guide and walk you through every step.
 >
-> xdbg also ships a **dedicated AI skill** (`skills/xdebug-docker-debug/SKILL.md`)
+> xdbg also ships a **dedicated AI skill** (`skills/xdbg/SKILL.md`)
 > that gives the agent context on debugging workflows, failure recovery, and best
 > practices — making adoption smoother. The agent will ask you before installing it.
 >
@@ -229,10 +229,16 @@ the agent handles the full lifecycle itself.
 
 ## Tools (`xdbg_*`)
 
+The server registers short tool names (`status`, `set_breakpoint`, …). The MCP
+client adds a prefix: opencode shows `xdbg_status`, Claude Code shows
+`mcp__xdbg__status`. This README uses the opencode names; the skill in
+`skills/xdbg/SKILL.md` uses the short names.
+
 ### `xdbg_status()`
 Returns the current debugger state (`no session`, `started`, `break`,
 `stopping`), the file and line where execution is paused (or `-` when not
-paused), and the number of queued breakpoints. Use it as the first call
+paused), and the number of breakpoints xdbg knows (queued and applied). The reply
+has three lines: `state=…`, `location=…`, `breakpoints=N`. Use it as the first call
 after firing a request or running a command to see whether the session was
 adopted and where the engine stopped. It's safe to call any time, with or
 without an active session. It does not advance execution or mutate state.
@@ -353,8 +359,7 @@ a session is active and running.
 
 ### `xdbg_stack()`
 Returns the call stack at the current pause point, with each frame's depth,
-function name, file (translated to a host path) and line. Returns
-`(no stack — not paused?)` when no session is paused. Use it to understand
+function name, file (translated to a host path) and line. Returns the error `no active session` when there is no session, and `(no stack — not paused?)` when the session is not at a break (for example right after `xdbg_request` returns at the script start). Use it to understand
 how you got to the current location. Safe to call any time, but only
 meaningful while paused.
 
@@ -394,13 +399,13 @@ For example, `{name:"$arr['a b']", value:"99"}` changes the array entry with the
 
 ### `xdbg_detach()`
 Detaches from the engine: lets the script finish on its own and drops the
-session. The DBGp listener closes, freeing port 9003. Use it when you're done
+session. xdbg closes the DBGp connection (the listener on port 9003 already closed when Xdebug connected). Use it when you're done
 debugging but want the request/command to complete normally. Returns
 `detached`.
 
 ### `xdbg_stop()`
 Stops the debugged script immediately — the engine terminates the PHP
-process and the session ends. The listener closes, freeing port 9003. Use it
+process and the session ends. xdbg closes the DBGp connection. Use it
 to abort a stuck request or command. Returns `stopped`.
 
 ### `xdbg_container_status()` / `xdbg_container_enable()` / `xdbg_container_disable()`
