@@ -2,13 +2,45 @@
 
 ## Prerequisites
 
-- **Go 1.21+** — required to build from source or via `go install`
 - **Docker** (or compatible container runtime) running your PHP application
 - **Xdebug 3.x** installed inside the PHP container, configured with `xdebug.start_with_request=yes` and `xdebug.client_host=host.docker.internal`
+- **Go 1.26+** — only needed for the `go install` and build-from-source options below
 
 ## Install
 
-### Option A — `go install` (recommended)
+### Option A — Prebuilt binary (recommended)
+
+Download the binary for your OS and architecture from the
+[latest release](https://github.com/crazy-goat/xdbg/releases/latest) and put it
+on your `PATH`. The release assets are:
+
+| Asset | Platform |
+|---|---|
+| `xdbg_linux_amd64` | Linux, x86-64 |
+| `xdbg_linux_arm64` | Linux, arm64 |
+| `xdbg_darwin_amd64` | macOS, Intel |
+| `xdbg_darwin_arm64` | macOS, Apple silicon |
+
+```bash
+# Example: macOS on Apple silicon, vX.Y.Z
+version=vX.Y.Z
+asset=xdbg_darwin_arm64
+base="https://github.com/crazy-goat/xdbg/releases/download/${version}"
+
+curl -fsSL -o "$asset" "${base}/${asset}"
+curl -fsSL -o checksums.txt "${base}/checksums.txt"
+grep " $asset\$" checksums.txt | sha256sum -c -   # macOS: shasum -a 256 -c -
+chmod +x "$asset"
+sudo install -m 0755 "$asset" /usr/local/bin/xdbg
+```
+
+Every release ships a `checksums.txt` with the SHA-256 of each binary; the
+`grep | sha256sum -c -` step verifies the download before you install it
+(`sha256sum -c -` reads the matching checksum line from stdin and looks for the
+asset in the current directory, which is why the file is downloaded under its
+release name first).
+
+### Option B — `go install`
 
 ```bash
 go install github.com/crazy-goat/xdbg@latest
@@ -34,7 +66,7 @@ Verify the installation:
 xdbg --help
 ```
 
-### Option B — Build from source
+### Option C — Build from source
 
 ```bash
 git clone https://github.com/crazy-goat/xdbg.git
