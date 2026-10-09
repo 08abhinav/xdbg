@@ -6,6 +6,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- `--listen-addr` chooses the address the DBGp listener binds to, `0.0.0.0` by default, so a laptop can keep the debug port off the network with `--listen-addr 127.0.0.1`. It takes an IP literal, so a name such as `localhost` is rejected instead of binding whichever address it resolves to first (#46)
+
+### Changed
+- The port-conflict check compares the address the DBGp listener binds to with the address lsof reports for the holder, so a debugger listening on another address is no longer reported as holding the port (#46)
+
+## [0.3.0] - 2026-10-07
+
+### Fixed
+- MCP `tools/call` requests now run concurrently and DBGp replies are routed to the right command by `transaction_id` through a per-connection reader goroutine. `xdbg_pause` can now interrupt a running `xdbg_run`, and `status`, `stop` and `detach` answer while a `run` is pending. When the engine reports `supports_async=0`, `xdbg_pause` returns `engine does not support async break (supports_async=0)` instead of blocking (#25)
+- `run_command` now watches the container command and returns as soon as it exits when no Xdebug connection arrives, reporting the command output and exit status (or that Xdebug is off) instead of waiting for the full timeout and losing the output. A short grace still honours an engine that connects just before the process exits (#58)
+- The DBGp listener now closes as soon as the first Xdebug connection is accepted, so a second Xdebug connection is refused at once instead of hanging in the listen backlog while `adopt()` runs a breakpoint-free script to completion. This no longer delays an unrelated PHP request by the full runtime of the first script (#34)
+- DBGp replies are now matched by root element and `transaction_id` instead of taking the next packet. `<stream>`, `<notify>` and non-matching `<response>` packets are skipped (and logged), so an unsolicited or injected reply can no longer desync the session (#33)
+- `xdbg --version` and the MCP `serverInfo.version` now fall back to the module build info when the `-ldflags` value is absent, so `go install github.com/crazy-goat/xdbg@vX.Y.Z` reports the tag instead of `dev`. Local builds and branch installs such as `@main` still report `dev`, and release binaries keep reporting the tag from `-ldflags` (#54)
+- `listen`, `request`, `request_from_files` and `run_command` now keep waiting when Xdebug connects just before the accept timeout and the DBGp handshake finishes after it, instead of reporting "no engine connected" and leaving an orphan paused session. The handshake has its own deadline, and a timeout drops the accepted connection so the next `listen` works (#27)
+- `xdbg` without the `mcp` subcommand accepts the same flags as `xdbg mcp` (#60)
+- Session status now clears the last paused source location when Xdebug resumes, stops, detaches, or disconnects (#36)
+- `summarize` now truncates long property values at 300 runes instead of 300 bytes and adds an ellipsis without splitting UTF-8 characters (#56)
+- `context_get`, `property_get` and `eval` now report a property's real child count from `numchildren` instead of the size of the first received page, so a 300-element array shows `array {300 children}`; empty arrays and objects show `{0 children}` instead of an empty value (#35)
+- DBGp commands now quote and escape property names and encode file URIs. Breakpoints and property access support spaces, quotes, backslashes, and non-ASCII characters. Host locations decode file URIs, but plain paths retain literal percent sequences. Property names reject NUL bytes; breakpoint removal rejects non-numeric engine ids and retains local handles (#26)
+- `breakpoint_remove` now accepts stable local handles (`q1`, `q2`, ...) to remove queued breakpoints without a session. Queued replies and queued or rejected list entries show the handles. Empty ids return an error without a state change. Failed engine removal leaves the local queue unchanged; `breakpoint_clear` remains best-effort (#29)
+- `example/bin/set-xdebug-on` and `set-xdebug-off` now call the `xdebug-on` / `xdebug-off` scripts in the container and fail when the change fails (#59)
+- `request_from_files` now accepts JSON headers files on one line or multiple lines. JSON files reject non-string values, including `null`, but accept empty strings. The line format rejects empty or invalid header names. Both request tools now honor `Host` headers, regardless of case. HTTP client errors return immediately instead of a misleading Xdebug timeout. The headers file descriptions now agree with the supported formats (#30)
+- `breakpoint_list` now lists queued breakpoints as host paths without an active session and returns `(none)` for an empty list. With an active session, it lists engine breakpoints and queued entries without engine ids. Rejected entries retain their error text in both cases (#28)
+- DBGp `<error>` responses now return command errors with the engine code and message instead of success. Engine errors do not close the session. A failed live breakpoint is not stored. Rejected queued breakpoints appear in stderr logs and `breakpoint_list`. `property_set` also returns an error for `success="0"` (#24)
+- Path translation now respects directory boundaries and preserves `/` as a root. Root comparisons and suffix extraction use clean paths, so dot segments and repeated separators do not select the wrong root. An empty `--docker-root` resolves relative paths under the local root and leaves engine paths unchanged. When roots overlap, the more specific root takes precedence for breakpoint paths (#23)
+- Invalid DBGp payload lengths no longer crash the MCP server or cause excessive allocation. xdbg rejects negative lengths and lengths above 64 MiB. A missing or invalid trailing NUL now causes an error and closes the engine connection (#22)
+
 ## [0.2.0] - 2026-10-06
 
 ### Added

@@ -8,7 +8,10 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/netip"
+	"net/url"
 	"os/exec"
+	"path"
 	"strconv"
 	"strings"
 	"sync"
@@ -16,23 +19,84 @@ import (
 	"time"
 )
 
+const maxPacketLen = 64 << 20 // 64 MiB
+
+// maxSkippedPackets limits how many non-matching packets the reader drops
+// before it fails the waiting commands.
+const maxSkippedPackets = 1000
+
+// handshakeTimeout bounds the DBGp handshake (the <init> packet plus the
+// feature/breakpoint round trips) after Xdebug has connected. It is a variable
+// so tests can shorten it.
+var handshakeTimeout = 10 * time.Second
+
+// handshakeGrace is added to the caller-side wait for a connected engine, so
+// adopt's own handshakeTimeout deadline always fires first and reports the
+// failure instead of the caller racing it.
+var handshakeGrace = 2 * time.Second
+
+// commandExitGrace is how long RunCommand keeps watching for a DBGp connection
+// after the container command exits. It honours an engine that connects just
+// before the process exits without waiting for the full timeout.
+const commandExitGrace = 500 * time.Millisecond
+
+// commandResult is the outcome of the container command started by RunCommand.
+type commandResult struct {
+	out string
+	err error
+}
+
 type bp struct {
 	file string // container path
 	line int
 	id   string // assigned by the engine on apply
+	qid  string // stable local handle
+	err  string // why the last apply failed
+}
+
+// readResult is one packet (or failure) delivered by the reader goroutine to a
+// waiting command.
+type readResult struct {
+	xml string
+	err error
+}
+
+// waiter is one in-flight DBGp command: the reader delivers its reply (or a
+// failure) on ch, and done is closed by the command when it stops waiting so
+// the reader never blocks on a channel nobody reads.
+type waiter struct {
+	ch   chan readResult
+	done chan struct{}
 }
 
 type session struct {
-	mu       sync.Mutex
-	conn     net.Conn
-	r        *bufio.Reader
-	tx       int
-	state    string // "no session" | "started" | "break" | "stopping"
-	file     string // current location, host path
-	line     int
-	pending  []bp
-	ready    chan struct{} // closed on each adopt; lets ListenWait/DoRequest await a connection
-	adoptErr error         // why the last adopt failed (nil on success); read by the waiters after ready closes
+	mu         sync.Mutex
+	conn       net.Conn
+	r          *bufio.Reader
+	tx         int
+	state      string // "no session" | "started" | "break" | "stopping"
+	file       string // current location, host path
+	line       int
+	pending    []bp
+	nextQID    int           // never reset when breakpoints are removed or cleared
+	ready      chan struct{} // closed on each adopt; lets ListenWait/DoRequest await a connection
+	adoptErr   error         // why the last adopt failed (nil on success); read by the waiters after ready closes
+	asyncBreak bool          // engine supports `break` while running (supports_async); optimistic by default
+
+	// Concurrency: wmu serializes the actual conn.Write of every command (and
+	// nothing else). Reading is owned by one reader goroutine per connection,
+	// which routes each <response> to its waiter by transaction_id. rmu guards
+	// the reader bookkeeping below. The command's conn and tx are read/written
+	// under mu so adopt (which holds mu for the whole handshake) is race-free.
+	wmu        sync.Mutex
+	rmu        sync.Mutex
+	readerConn net.Conn        // the connection the current reader serves; nil when no reader runs
+	waiters    map[int]*waiter // transaction_id -> waiting command
+
+	// acceptedConn is the freshly accepted engine connection between Accept and
+	// adopt taking it over. A caller timeout closes it so an adopt that has not
+	// started yet cannot leave an orphan session. Guarded by mu.
+	acceptedConn net.Conn
 
 	dbgAddr string       // "host:port" where Xdebug connects (e.g. "0.0.0.0:9003")
 	ln      net.Listener // non-nil only while the ephemeral listener is open
@@ -49,33 +113,56 @@ type session struct {
 }
 
 func newSession(localRoot, dockerRoot string) *session {
+	localRoot = path.Clean(localRoot)
+	if dockerRoot != "" {
+		dockerRoot = path.Clean(dockerRoot)
+	}
 	return &session{
 		state:      "no session",
 		ready:      make(chan struct{}),
-		localRoot:  strings.TrimRight(localRoot, "/"),
-		dockerRoot: strings.TrimRight(dockerRoot, "/"),
+		asyncBreak: true, // assume the engine can break while running until it says otherwise
+		localRoot:  localRoot,
+		dockerRoot: dockerRoot,
 	}
 }
 
-// openOnce opens the DBGp port, accepts exactly one Xdebug connection, calls
-// adopt(), then closes the port. The port is closed whether the session ends
-// cleanly or times out, so browser/curl requests can never accidentally connect
-// to a debug session that is no longer active.
+// openOnce opens the DBGp port and accepts exactly one Xdebug connection. As
+// soon as the first connection is accepted, the port is closed, so a second
+// Xdebug connection is refused at once instead of hanging in the listen backlog
+// while adopt() runs. It then calls adopt() to drive the session. The deferred
+// close covers the timeout/closeLn cases too, so browser/curl requests can
+// never accidentally connect to a debug session that is no longer active.
+//
+// It returns acceptResult, which receives the listener's Accept error: nil once
+// a connection was accepted (before the DBGp handshake starts), or a non-nil
+// error when the accept deadline expired or the listener was closed. Waiters
+// use it to tell "no engine connected" from "engine connected but the handshake
+// is still running".
 //
 // If the port is already in use, acquireListener waits up to portWait for it to
 // become free. This lets multiple MCP instances coexist — one debugs while the
 // other waits for its turn.
-func (s *session) openOnce(timeout, portWait time.Duration) error {
+func (s *session) openOnce(timeout, portWait time.Duration) (<-chan error, error) {
 	ln, err := s.acquireListener(portWait)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	s.mu.Lock()
 	s.ln = ln
 	s.mu.Unlock()
 	log.Printf("DBGp listener open %s (local=%s docker=%s)", s.dbgAddr, s.localRoot, s.dockerRoot)
 
+	acceptResult := make(chan error, 1)
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("DBGp accept goroutine panic: %v", r)
+				select {
+				case acceptResult <- fmt.Errorf("DBGp accept goroutine panic: %v", r):
+				default:
+				}
+			}
+		}()
 		defer func() {
 			ln.Close()
 			s.mu.Lock()
@@ -88,11 +175,26 @@ func (s *session) openOnce(timeout, portWait time.Duration) error {
 		ln.(*net.TCPListener).SetDeadline(time.Now().Add(timeout))
 		conn, err := ln.Accept()
 		if err != nil {
+			acceptResult <- err
 			return // timeout or closeLn() called
 		}
+		// Publish the accepted connection before waking the waiter, so a caller
+		// timeout can always drop it even if adopt has not started yet.
+		s.mu.Lock()
+		s.acceptedConn = conn
+		s.mu.Unlock()
+		acceptResult <- nil
+		// Close the listener before adopt() runs: adopt can execute the script
+		// to completion (no breakpoints), and without this a second Xdebug
+		// connection would complete the TCP handshake in the kernel backlog and
+		// block until the deferred close, delaying an unrelated PHP request by
+		// the whole runtime of the first script. A second connect now gets
+		// "connection refused" and Xdebug continues at once. s.ln stays set until
+		// adopt returns, so acquireListener keeps refusing a new listen.
+		ln.Close()
 		s.adopt(conn)
 	}()
-	return nil
+	return acceptResult, nil
 }
 
 // acquireListener tries to open the DBGp port. If our own listener is already
@@ -108,18 +210,24 @@ func (s *session) acquireListener(portWait time.Duration) (net.Listener, error) 
 	s.mu.Unlock()
 
 	deadline := time.Now().Add(portWait)
+	// A port of 0 asks the OS to pick a free port, so it can never conflict with
+	// another process. Skip the lsof probe then: it is pointless and slow.
+	_, port, portErr := net.SplitHostPort(s.dbgAddr)
+	probe := portErr != nil || port != "0"
 	for {
 		// On macOS Go sets SO_REUSEADDR, so net.Listen succeeds even when
 		// another process is already listening on the same port — we'd open a
 		// "ghost" listener that never receives connections. Probe with lsof
 		// first so we detect the conflict and wait for the port to actually be
 		// free.
-		if holder := portHolder(s.dbgAddr); holder != "" {
-			if time.Now().After(deadline) {
-				return nil, fmt.Errorf("xdebug port %s is busy (held by: %s) — another debugger is using it; wait for it to finish or stop that session", s.dbgAddr, holder)
+		if probe {
+			if holder := portHolder(s.dbgAddr); holder != "" {
+				if time.Now().After(deadline) {
+					return nil, fmt.Errorf("xdebug port %s is busy (held by: %s) — another debugger is using it; wait for it to finish or stop that session", s.dbgAddr, holder)
+				}
+				time.Sleep(200 * time.Millisecond)
+				continue
 			}
-			time.Sleep(200 * time.Millisecond)
-			continue
 		}
 		ln, err := net.Listen("tcp", s.dbgAddr)
 		if err == nil {
@@ -147,10 +255,63 @@ func isAddrInUse(err error) bool {
 	return strings.Contains(err.Error(), "address already in use")
 }
 
-// portHolder uses lsof to identify the process listening on addr (host:port).
-// Returns a human-readable string (COMMAND PID USER) or "" if unavailable.
+// conflicts reports whether a listener lsof names `name` would take the
+// connection a listener on bindHost wants to receive. A holder on the same
+// address and a holder on a wildcard address both take it; when xdbg binds a
+// wildcard, every holder does. A name it cannot read conflicts, which keeps the
+// port-only verdict the default --listen-addr 0.0.0.0 has always had.
+func conflicts(bindHost, name string) bool {
+	host, ok := lsofHost(name)
+	if !ok {
+		return true
+	}
+	if isWildcardHost(bindHost) || isWildcardHost(host) {
+		return true
+	}
+	return canonicalAddr(host) == canonicalAddr(bindHost)
+}
+
+// canonicalAddr spells an IP literal one way, so equivalent addresses compare
+// equal (`::1` and `0:0:0:0:0:0:0:1`, `::ffff:127.0.0.1` and `127.0.0.1`). A
+// value it cannot parse comes back unchanged, and `*` is not an address.
+func canonicalAddr(host string) string {
+	if a, err := netip.ParseAddr(host); err == nil {
+		return a.Unmap().String()
+	}
+	return host
+}
+
+// lsofHost reads the address out of lsof's NAME column, which -nP writes as
+// `host:port` with an IPv6 host in brackets and a wildcard as `*`: `*:9003`,
+// `127.0.0.1:9003`, `[::1]:9003`.
+func lsofHost(name string) (string, bool) {
+	if strings.HasPrefix(name, "[") {
+		end := strings.Index(name, "]")
+		if end < 0 {
+			return "", false
+		}
+		return name[1:end], true
+	}
+	i := strings.LastIndex(name, ":")
+	if i <= 0 {
+		return "", false
+	}
+	return name[:i], true
+}
+
+// isWildcardHost reports whether host is the bind-anywhere address of either
+// family, in Go's spelling (`0.0.0.0`, `::`) or lsof's (`*`).
+func isWildcardHost(host string) bool {
+	return host == "*" || host == "0.0.0.0" || host == "::"
+}
+
+// portHolder uses lsof to identify the process listening on addr's port that
+// would take the connection addr's listener wants, so binding a specific
+// --listen-addr does not report a debugger on another address as busy. Returns a
+// human-readable string (COMMAND PID USER), or "" when nothing conflicts or lsof
+// is unavailable.
 func portHolder(addr string) string {
-	_, port, err := net.SplitHostPort(addr)
+	host, port, err := net.SplitHostPort(addr)
 	if err != nil {
 		return ""
 	}
@@ -158,12 +319,29 @@ func portHolder(addr string) string {
 	if err != nil {
 		return ""
 	}
-	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	return portHolderFromLsof(host, string(out))
+}
+
+// portHolderFromLsof picks the holder in lsof's output that would take the
+// connection a listener on bindHost wants, or "" when none does. lsof lists the
+// holders of a port in its own order, so every line is read: the first one is not
+// necessarily the one that matters. macOS writes the state into the NAME column
+// (`127.0.0.1:9003 (LISTEN)`); Linux lsof does not.
+func portHolderFromLsof(bindHost, out string) string {
+	lines := strings.Split(strings.TrimSpace(out), "\n")
 	for _, line := range lines[1:] { // skip header
 		fields := strings.Fields(line)
-		if len(fields) >= 3 {
-			return fmt.Sprintf("%s (pid=%s user=%s)", fields[0], fields[1], fields[2])
+		if len(fields) < 3 {
+			continue
 		}
+		name := fields[len(fields)-1]
+		if name == "(LISTEN)" && len(fields) > 3 {
+			name = fields[len(fields)-2]
+		}
+		if !conflicts(bindHost, name) {
+			continue
+		}
+		return fmt.Sprintf("%s (pid=%s user=%s)", fields[0], fields[1], fields[2])
 	}
 	return ""
 }
@@ -183,14 +361,20 @@ func (s *session) closeLn() {
 func (s *session) adopt(conn net.Conn) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.acceptedConn = nil
 	if s.conn != nil {
 		s.conn.Close()
 	}
 	s.conn = conn
 	s.r = bufio.NewReader(conn)
+	s.wmu.Lock()
 	s.tx = 0
+	s.wmu.Unlock()
 	s.file, s.line = "", 0
 	s.adoptErr = nil
+	// A stuck or half-connected engine must not hold s.mu forever: the deadline
+	// turns it into a read/write error, which failHandshakeLocked reports.
+	conn.SetDeadline(time.Now().Add(handshakeTimeout))
 
 	initXML, err := s.readPacket()
 	if err != nil {
@@ -210,10 +394,17 @@ func (s *session) adopt(conn net.Conn) {
 	s.rawLocked("feature_set", "-n max_depth -v 3")      //nolint:errcheck // best-effort feature negotiation
 	s.rawLocked("feature_set", "-n max_children -v 100") //nolint:errcheck // best-effort feature negotiation
 	s.rawLocked("feature_set", "-n max_data -v 4096")    //nolint:errcheck // best-effort feature negotiation
+	s.negotiateAsyncBreakLocked()
 	for i := range s.pending {
-		if r, _, err := s.rawLocked("breakpoint_set", fmt.Sprintf("-t line -f %s -n %d", fileURI(s.pending[i].file), s.pending[i].line)); err == nil && r != nil {
-			s.pending[i].id = r.ID
+		p := &s.pending[i]
+		p.id, p.err = "", ""
+		r, _, err := s.rawLocked("breakpoint_set", breakpointSetArgs(p.file, p.line))
+		if err != nil {
+			p.err = err.Error()
+			log.Printf("breakpoint %s:%d rejected: %v", p.file, p.line, err)
+			continue
 		}
+		p.id = r.ID
 	}
 
 	// No breakpoints: run the script to completion and finalize the session so
@@ -226,25 +417,48 @@ func (s *session) adopt(conn net.Conn) {
 		if r != nil && r.Status == "stopping" {
 			s.rawLocked("stop", "") //nolint:errcheck // best-effort stop
 		}
-		if s.conn != nil {
-			s.conn.Close()
-			s.conn = nil
-		}
-		s.state = "no session"
+		s.dropLocked()
+	}
+	if s.conn != nil {
+		s.conn.SetDeadline(time.Time{})
+		s.startReader(s.conn, s.r)
 	}
 
 	s.signalReadyLocked()
+}
+
+// negotiateAsyncBreakLocked asks the engine whether it can interrupt a running
+// script (DBGp feature supports_async). When the engine answers "0", pause
+// cannot work and cmd("break") is rejected early instead of blocking. Any
+// failure (old engine, no property, read error) leaves the optimistic default
+// in place. Caller holds mu; only runs during adopt, before the reader starts.
+func (s *session) negotiateAsyncBreakLocked() {
+	r, _, err := s.rawLocked("feature_get", "-n supports_async")
+	if err != nil || r == nil || len(r.Props) == 0 {
+		return
+	}
+	s.asyncBreak = strings.TrimSpace(decodeVal(r.Props[0])) != "0"
+	if !s.asyncBreak {
+		log.Printf("engine reports supports_async=0: pause cannot interrupt a running run")
+	}
+}
+
+// dropLocked closes the engine connection and resets the session state.
+// s.mu must be held.
+func (s *session) dropLocked() {
+	if s.conn != nil {
+		_ = s.conn.Close()
+		s.conn = nil
+	}
+	s.state = "no session"
+	s.clearLocationLocked()
 }
 
 // failHandshakeLocked drops the connection after a failed DBGp handshake and
 // wakes the waiters with an error. s.mu must be held.
 func (s *session) failHandshakeLocked(step string, err error) {
 	log.Printf("%s: %v", step, err)
-	if s.conn != nil {
-		s.conn.Close()
-		s.conn = nil
-	}
-	s.state = "no session"
+	s.dropLocked()
 	s.adoptErr = fmt.Errorf("DBGp handshake failed after Xdebug connected (%s): %w", step, err)
 	s.signalReadyLocked()
 }
@@ -266,8 +480,12 @@ func (s *session) handshakeError() error {
 // --- wire protocol ----------------------------------------------------------
 
 // readPacket reads one length-prefixed, NUL-terminated DBGp packet: LEN\0XML\0
-func (s *session) readPacket() (string, error) {
-	lenStr, err := s.r.ReadString(0)
+func (s *session) readPacket() (string, error) { return readPacketFrom(s.r) }
+
+// readPacketFrom reads one DBGp packet from r. It is shared by the synchronous
+// handshake (readPacket) and the per-connection reader goroutine.
+func readPacketFrom(r *bufio.Reader) (string, error) {
+	lenStr, err := r.ReadString(0)
 	if err != nil {
 		return "", err
 	}
@@ -275,81 +493,394 @@ func (s *session) readPacket() (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("bad length %q: %w", lenStr, err)
 	}
+	if n < 0 || n > maxPacketLen {
+		return "", fmt.Errorf("bad length %d (max %d)", n, maxPacketLen)
+	}
 	buf := make([]byte, n)
-	if _, err := io.ReadFull(s.r, buf); err != nil {
+	if _, err := io.ReadFull(r, buf); err != nil {
 		return "", err
 	}
-	s.r.ReadByte() // trailing NUL
+	b, err := r.ReadByte()
+	if err != nil {
+		return "", fmt.Errorf("read trailing NUL: %w", err)
+	}
+	if b != 0 {
+		return "", fmt.Errorf("expected NUL after packet, got %q", b)
+	}
 	return string(buf), nil
 }
 
-// rawLocked sends one command and returns the parsed response. Caller holds mu.
+// rawLocked sends one command and reads its reply synchronously. It is used by
+// the adopt handshake (before the reader goroutine starts) and by tests; normal
+// commands go through cmd, which does not hold s.mu while waiting. Caller holds mu.
 func (s *session) rawLocked(name, args string) (*xResp, string, error) {
 	if s.conn == nil {
 		return nil, "", fmt.Errorf("no active session")
 	}
+	s.wmu.Lock()
 	s.tx++
-	line := name + " -i " + strconv.Itoa(s.tx)
+	tx := s.tx
+	line := name + " -i " + strconv.Itoa(tx)
 	if args != "" {
 		line += " " + args
 	}
-	if _, err := s.conn.Write([]byte(line + "\x00")); err != nil {
-		s.state = "no session"
-		return nil, "", err
+	_, werr := s.conn.Write([]byte(line + "\x00"))
+	s.wmu.Unlock()
+	if werr != nil {
+		s.dropLocked()
+		return nil, "", werr
 	}
-	xmlStr, err := s.readPacket()
-	if err != nil {
-		s.state = "no session"
-		return nil, "", err
-	}
+	want := strconv.Itoa(tx)
 	var r xResp
-	if err := unmarshal(xmlStr, &r); err != nil {
-		return nil, xmlStr, fmt.Errorf("parse %s response: %w", name, err)
+	var xmlStr string
+	for skipped := 0; ; skipped++ {
+		if skipped > maxSkippedPackets {
+			return nil, "", fmt.Errorf("%s: no response with transaction_id %s after %d other packets", name, want, maxSkippedPackets)
+		}
+		var err error
+		xmlStr, err = s.readPacket()
+		if err != nil {
+			s.dropLocked() // keep the #36 behaviour: drop the connection on a read error
+			return nil, "", err
+		}
+		r = xResp{}
+		if err = unmarshal(xmlStr, &r); err != nil {
+			return nil, xmlStr, fmt.Errorf("parse %s response: %w", name, err)
+		}
+		if r.XMLName.Local == "response" && r.TransactionID == want {
+			break
+		}
+		log.Printf("dropping DBGp packet while waiting for %s (tx %s): <%s transaction_id=%q>", name, want, r.XMLName.Local, r.TransactionID)
 	}
 	if r.Status != "" {
 		s.state = r.Status
+		if r.Status != "break" {
+			s.clearLocationLocked()
+		}
 	}
 	if r.Message != nil && r.Message.Filename != "" {
 		s.file, s.line = s.toHost(r.Message.Filename), r.Message.Lineno
 	}
-	return &r, xmlStr, nil
+	return &r, xmlStr, r.err(name)
 }
 
-// cmd is the locking wrapper used by public methods.
+// cmd sends one DBGp command and returns its response. It does not hold s.mu
+// while waiting, so another MCP call (e.g. pause) can run at the same time.
 func (s *session) cmd(name, args string) (*xResp, string, error) {
+	return s.cmdWithin(name, args, 0)
+}
+
+// cmdWithin is cmd with an optional deadline. A non-zero timeout bounds both
+// the write (via a write deadline) and the wait for the reply, which is what
+// Detach/Stop use so they cannot hang behind a pending run. It returns
+// "no active session" when the connection is gone, and the reader's error when
+// the connection drops while waiting.
+func (s *session) cmdWithin(name, args string, timeout time.Duration) (*xResp, string, error) {
+	// Read conn under mu so adopt (which holds mu for the whole handshake)
+	// cannot race with a command issued mid-handshake.
+	s.mu.Lock()
+	conn := s.conn
+	s.mu.Unlock()
+	if conn == nil {
+		return nil, "", fmt.Errorf("no active session")
+	}
+
+	w := &waiter{ch: make(chan readResult, 1), done: make(chan struct{})}
+	s.wmu.Lock()
+	s.rmu.Lock()
+	if s.readerConn != conn {
+		s.rmu.Unlock()
+		s.wmu.Unlock()
+		return nil, "", fmt.Errorf("no active session")
+	}
+	// Assign the transaction id only once we know the command will be sent, so
+	// a rejected call does not leave a gap. tx is guarded by wmu here; adopt's
+	// handshake writes it under mu but always finishes before a reader starts.
+	s.tx++
+	tx := s.tx
+	s.waiters[tx] = w
+	s.rmu.Unlock()
+
+	line := name + " -i " + strconv.Itoa(tx)
+	if args != "" {
+		line += " " + args
+	}
+	if timeout > 0 {
+		_ = conn.SetWriteDeadline(time.Now().Add(timeout))
+	}
+	_, werr := conn.Write([]byte(line + "\x00"))
+	if timeout > 0 {
+		_ = conn.SetWriteDeadline(time.Time{})
+	}
+	s.wmu.Unlock()
+	if werr != nil {
+		s.removeWaiter(tx, w)
+		close(w.done)
+		s.dropConn(conn)
+		return nil, "", werr
+	}
+	defer close(w.done)
+	defer s.removeWaiter(tx, w)
+
+	var timeoutCh <-chan time.Time
+	if timeout > 0 {
+		t := time.NewTimer(timeout)
+		defer t.Stop()
+		timeoutCh = t.C
+	}
+	select {
+	case res := <-w.ch:
+		return s.finishRead(name, strconv.Itoa(tx), res)
+	case <-timeoutCh:
+		return nil, "", fmt.Errorf("%s: no response within %s", name, timeout)
+	}
+}
+
+// finishRead parses a reply delivered by the reader and applies it to the
+// session. It mirrors the matching rawLocked does during the handshake.
+func (s *session) finishRead(name, wantTx string, res readResult) (*xResp, string, error) {
+	if res.err != nil {
+		if res.xml != "" {
+			return nil, res.xml, fmt.Errorf("parse %s response: %w", name, res.err)
+		}
+		return nil, "", res.err
+	}
+	var r xResp
+	if err := unmarshal(res.xml, &r); err != nil {
+		return nil, res.xml, fmt.Errorf("parse %s response: %w", name, err)
+	}
+	if r.XMLName.Local != "response" || r.TransactionID != wantTx {
+		return nil, res.xml, fmt.Errorf("%s: unexpected DBGp packet <%s transaction_id=%q>", name, r.XMLName.Local, r.TransactionID)
+	}
+	s.applyResp(&r)
+	return &r, res.xml, r.err(name)
+}
+
+// applyResp records the state and location carried by a response.
+func (s *session) applyResp(r *xResp) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.rawLocked(name, args)
+	if r.Status != "" {
+		s.state = r.Status
+		if r.Status != "break" {
+			s.clearLocationLocked()
+		}
+	}
+	if r.Message != nil && r.Message.Filename != "" {
+		s.file, s.line = s.toHost(r.Message.Filename), r.Message.Lineno
+	}
+}
+
+// removeWaiter drops tx from the waiter table when it is still ours.
+func (s *session) removeWaiter(tx int, w *waiter) {
+	s.rmu.Lock()
+	if s.waiters != nil && s.waiters[tx] == w {
+		delete(s.waiters, tx)
+	}
+	s.rmu.Unlock()
+}
+
+// dropConn closes the session when conn is still the active connection.
+func (s *session) dropConn(conn net.Conn) {
+	s.mu.Lock()
+	if s.conn == conn {
+		s.dropLocked()
+	}
+	s.mu.Unlock()
+}
+
+// --- reader goroutine -------------------------------------------------------
+
+// startReader launches the goroutine that owns reading for conn. It is called
+// at the end of a successful adopt, after the synchronous handshake is done, so
+// the reader never steals the <init> or handshake replies. Each connection gets
+// a fresh waiter table, so a late reader for an old connection cannot disturb
+// the current one.
+//
+// Replacing the reader also orphans any command still waiting on the previous
+// connection: its reader now sees a readerConn mismatch and returns without
+// failing them. Fail them here with a connection-closed error so a command such
+// as a timeout-less run cannot block forever.
+func (s *session) startReader(conn net.Conn, r *bufio.Reader) {
+	s.rmu.Lock()
+	previous := s.waiters
+	s.readerConn = conn
+	s.waiters = make(map[int]*waiter)
+	s.rmu.Unlock()
+	for _, w := range previous {
+		deliver(w, readResult{err: fmt.Errorf("connection closed")})
+	}
+	go s.readLoop(conn, r)
+}
+
+// readLoop reads packets and routes each <response> to its waiter by
+// transaction_id. Stream/notify/unsolicited packets are logged and dropped, as
+// rawLocked did (#33); a malformed packet fails every waiter because it cannot
+// be attributed. When the connection ends, every pending waiter is failed and
+// the session is dropped.
+func (s *session) readLoop(conn net.Conn, r *bufio.Reader) {
+	skipped := 0
+	for {
+		xmlStr, err := readPacketFrom(r)
+		if err != nil {
+			s.finishReader(conn, err)
+			return
+		}
+		var resp xResp
+		if perr := unmarshal(xmlStr, &resp); perr != nil {
+			log.Printf("dropping malformed DBGp packet: %v", perr)
+			s.failWaiters(conn, func(int) error { return perr }, xmlStr)
+			continue
+		}
+		if resp.XMLName.Local == "response" && resp.TransactionID != "" {
+			if s.deliverResponse(conn, resp.TransactionID, xmlStr) {
+				skipped = 0
+				continue
+			}
+		}
+		log.Printf("dropping DBGp packet while waiting: <%s transaction_id=%q>", resp.XMLName.Local, resp.TransactionID)
+		skipped++
+		if skipped > maxSkippedPackets {
+			s.failWaiters(conn, func(tx int) error {
+				return fmt.Errorf("no response with transaction_id %d after %d other packets", tx, maxSkippedPackets)
+			}, "")
+			skipped = 0
+		}
+	}
+}
+
+// deliverResponse hands a response to the waiter for tx, if one is registered
+// for the current connection. It reports whether a waiter existed.
+func (s *session) deliverResponse(conn net.Conn, txStr, xmlStr string) bool {
+	tx, err := strconv.Atoi(txStr)
+	if err != nil {
+		return false
+	}
+	s.rmu.Lock()
+	if s.readerConn != conn {
+		s.rmu.Unlock()
+		return false
+	}
+	w := s.waiters[tx]
+	s.rmu.Unlock()
+	if w == nil {
+		return false
+	}
+	deliver(w, readResult{xml: xmlStr})
+	return true
+}
+
+// failWaiters fails every registered waiter with the given reason and clears
+// the table. reason builds the error for each transaction id.
+func (s *session) failWaiters(conn net.Conn, reason func(int) error, xmlStr string) {
+	s.rmu.Lock()
+	if s.readerConn != conn {
+		s.rmu.Unlock()
+		return
+	}
+	ws := s.waiters
+	s.waiters = make(map[int]*waiter)
+	s.rmu.Unlock()
+	for tx, w := range ws {
+		deliver(w, readResult{xml: xmlStr, err: reason(tx)})
+	}
+}
+
+// finishReader drops the session (when conn is still active) and then fails the
+// pending waiters, so a caller woken by the failure observes state=no session.
+func (s *session) finishReader(conn net.Conn, err error) {
+	s.rmu.Lock()
+	if s.readerConn != conn {
+		s.rmu.Unlock()
+		return
+	}
+	ws := s.waiters
+	s.waiters = nil
+	s.readerConn = nil
+	s.rmu.Unlock()
+
+	s.mu.Lock()
+	if s.conn == conn {
+		s.dropLocked()
+	}
+	s.mu.Unlock()
+
+	for _, w := range ws {
+		deliver(w, readResult{err: err})
+	}
+}
+
+// deliver sends res to w without ever blocking: if the command already stopped
+// waiting, w.done is closed and the result is dropped.
+func deliver(w *waiter, res readResult) {
+	select {
+	case w.ch <- res:
+	case <-w.done:
+	}
 }
 
 // --- path translation -------------------------------------------------------
 
+// under reports whether p equals root or is inside root at a path boundary.
+func under(p, root string) bool {
+	if root == "/" {
+		return path.IsAbs(p)
+	}
+	return root != "" && (p == root || strings.HasPrefix(p, root+"/"))
+}
+
 // toContainer maps a host (absolute or project-relative) path to the container path.
 func (s *session) toContainer(p string) string {
+	if s.dockerRoot == "" {
+		if path.IsAbs(p) {
+			return p
+		}
+		return path.Join(s.localRoot, p)
+	}
+	cleanPath := path.Clean(p)
 	switch {
-	case strings.HasPrefix(p, s.dockerRoot):
+	// When both roots match, the more specific root takes precedence.
+	case under(cleanPath, s.localRoot) && (!under(cleanPath, s.dockerRoot) || len(s.localRoot) > len(s.dockerRoot)):
+		return path.Join(s.dockerRoot, strings.TrimPrefix(cleanPath, s.localRoot))
+	case under(cleanPath, s.dockerRoot):
 		return p
-	case strings.HasPrefix(p, s.localRoot):
-		return s.dockerRoot + p[len(s.localRoot):]
-	case strings.HasPrefix(p, "/"):
+	case path.IsAbs(p):
 		return p // some other absolute path; pass through
 	default:
-		return s.dockerRoot + "/" + strings.TrimLeft(p, "/")
+		return path.Join(s.dockerRoot, p)
 	}
 }
 
 // toHost maps a container fileuri/path back to a host path for display.
 func (s *session) toHost(fileuri string) string {
-	p := strings.TrimPrefix(fileuri, "file://")
-	if strings.HasPrefix(p, s.dockerRoot) {
-		return s.localRoot + p[len(s.dockerRoot):]
+	p := fileuri
+	if strings.HasPrefix(fileuri, "file://") {
+		if u, err := url.Parse(fileuri); err == nil {
+			p = u.Path
+		} else {
+			p = strings.TrimPrefix(fileuri, "file://")
+		}
+	}
+	cleanPath := path.Clean(p)
+	if under(cleanPath, s.dockerRoot) {
+		return path.Join(s.localRoot, strings.TrimPrefix(cleanPath, s.dockerRoot))
 	}
 	return p
 }
 
-func fileURI(containerPath string) string { return "file://" + containerPath }
+func fileURI(containerPath string) string {
+	return (&url.URL{Scheme: "file", Path: containerPath}).String()
+}
+
+func breakpointSetArgs(containerPath string, line int) string {
+	return fmt.Sprintf("-t line -f %s -n %d", quoteArg(fileURI(containerPath)), line)
+}
 
 // --- public command methods (used by both MCP and HTTP front-ends) ----------
+
+func (s *session) clearLocationLocked() {
+	s.file, s.line = "", 0
+}
 
 func (s *session) location() string {
 	if s.file == "" {
@@ -369,57 +900,103 @@ func (s *session) SetBreakpoint(file string, line int) (string, error) {
 		return "", fmt.Errorf("file and line>0 required")
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	cpath := s.toContainer(file)
-	b := bp{file: cpath, line: line}
-	if s.conn != nil && (s.state == "started" || s.state == "break") {
-		r, _, err := s.rawLocked("breakpoint_set", fmt.Sprintf("-t line -f %s -n %d", fileURI(cpath), line))
-		if err != nil {
-			return "", err
-		}
-		b.id = r.ID
+	s.nextQID++
+	b := bp{file: cpath, line: line, qid: "q" + strconv.Itoa(s.nextQID)}
+	live := s.conn != nil && (s.state == "started" || s.state == "break")
+	s.mu.Unlock()
+	if !live {
+		s.mu.Lock()
 		s.pending = append(s.pending, b)
-		return fmt.Sprintf("breakpoint set id=%s %s:%d", b.id, cpath, line), nil
+		s.mu.Unlock()
+		return fmt.Sprintf("breakpoint queued %s %s:%d (applied on next session)", b.qid, cpath, line), nil
 	}
-	s.pending = append(s.pending, b)
-	return fmt.Sprintf("breakpoint queued %s:%d (applied on next session)", cpath, line), nil
-}
-
-func (s *session) BreakpointList() (string, error) {
-	r, _, err := s.cmd("breakpoint_list", "")
+	r, _, err := s.cmd("breakpoint_set", breakpointSetArgs(cpath, line))
 	if err != nil {
 		return "", err
 	}
-	if len(r.Breakpoints) == 0 {
-		s.mu.Lock()
-		defer s.mu.Unlock()
-		var b strings.Builder
-		for _, p := range s.pending {
-			fmt.Fprintf(&b, "queued %s:%d\n", s.toHost(p.file), p.line)
-		}
-		if b.Len() == 0 {
-			return "(none)", nil
-		}
-		return b.String(), nil
-	}
+	b.id = r.ID
+	s.mu.Lock()
+	s.pending = append(s.pending, b)
+	s.mu.Unlock()
+	return fmt.Sprintf("breakpoint set id=%s %s:%d", b.id, cpath, line), nil
+}
+
+func (s *session) BreakpointList() (string, error) {
+	s.mu.Lock()
+	hasConn := s.conn != nil
+	s.mu.Unlock()
 	var b strings.Builder
-	for _, e := range r.Breakpoints {
-		fmt.Fprintf(&b, "id=%s %s %s:%d\n", e.ID, e.State, s.toHost(e.Filename), e.Lineno)
+	if hasConn {
+		r, _, err := s.cmd("breakpoint_list", "")
+		if err != nil {
+			return "", err
+		}
+		s.mu.Lock()
+		for _, e := range r.Breakpoints {
+			fmt.Fprintf(&b, "id=%s %s %s:%d\n", e.ID, e.State, s.toHost(e.Filename), e.Lineno)
+		}
+		s.mu.Unlock()
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, p := range s.pending {
+		if p.err != "" {
+			fmt.Fprintf(&b, "rejected %s %s:%d: %s\n", p.qid, s.toHost(p.file), p.line, p.err)
+		} else if s.conn == nil || p.id == "" {
+			fmt.Fprintf(&b, "queued %s %s:%d\n", p.qid, s.toHost(p.file), p.line)
+		}
+	}
+	if b.Len() == 0 {
+		return "(none)", nil
 	}
 	return b.String(), nil
 }
 
+func validateBreakpointID(id string) error {
+	if id == "" {
+		return fmt.Errorf("breakpoint id must be numeric")
+	}
+	for _, c := range id {
+		if c < '0' || c > '9' {
+			return fmt.Errorf("breakpoint id must be numeric: %q", id)
+		}
+	}
+	return nil
+}
+
 func (s *session) BreakpointRemove(id string) (string, error) {
+	if id == "" {
+		return "", fmt.Errorf("id required")
+	}
 	s.mu.Lock()
+	index, engineID := -1, id
 	for i, p := range s.pending {
-		if p.id == id {
-			s.pending = append(s.pending[:i], s.pending[i+1:]...)
+		if p.qid == id || p.id == id {
+			index, engineID = i, p.id
 			break
 		}
 	}
+	if engineID != "" {
+		if err := validateBreakpointID(engineID); err != nil {
+			s.mu.Unlock()
+			return "", err
+		}
+	}
+	hasConn := s.conn != nil
 	s.mu.Unlock()
-	if _, _, err := s.cmd("breakpoint_remove", "-d "+id); err != nil {
-		return "", err
+	if index == -1 && !hasConn {
+		return "", fmt.Errorf("no active session")
+	}
+	if hasConn && engineID != "" {
+		if _, _, err := s.cmd("breakpoint_remove", "-d "+engineID); err != nil {
+			return "", err
+		}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if index != -1 {
+		s.pending = append(s.pending[:index], s.pending[index+1:]...)
 	}
 	return "removed " + id, nil
 }
@@ -428,6 +1005,14 @@ func (s *session) BreakpointRemove(id string) (string, error) {
 // applied (active in the engine). Safe to call with or without an active session.
 func (s *session) BreakpointClearAll() (string, error) {
 	s.mu.Lock()
+	for _, p := range s.pending {
+		if p.id != "" {
+			if err := validateBreakpointID(p.id); err != nil {
+				s.mu.Unlock()
+				return "", err
+			}
+		}
+	}
 	pending := s.pending
 	s.pending = nil
 	s.mu.Unlock()
@@ -442,6 +1027,14 @@ func (s *session) BreakpointClearAll() (string, error) {
 
 // step runs run/step_into/step_over/step_out/break and reports the new location.
 func (s *session) step(cmd string) (string, error) {
+	if cmd == "break" {
+		s.mu.Lock()
+		async := s.asyncBreak
+		s.mu.Unlock()
+		if !async {
+			return "", fmt.Errorf("engine does not support async break (supports_async=0)")
+		}
+	}
 	r, _, err := s.cmd(cmd, "")
 	if err != nil {
 		return "", err
@@ -493,9 +1086,6 @@ func (s *session) Eval(expr string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if r.Error != nil {
-		return "", fmt.Errorf("eval error %s: %s", r.Error.Code, r.Error.Message)
-	}
 	if len(r.Props) == 0 {
 		return "(no result)", nil
 	}
@@ -503,7 +1093,10 @@ func (s *session) Eval(expr string) (string, error) {
 }
 
 func (s *session) PropertyGet(name string, depth int) (string, error) {
-	r, _, err := s.cmd("property_get", fmt.Sprintf("-d %d -n %s", depth, name))
+	if strings.ContainsRune(name, 0) {
+		return "", fmt.Errorf("name must not contain NUL")
+	}
+	r, _, err := s.cmd("property_get", fmt.Sprintf("-d %d -n %s", depth, quoteArg(name)))
 	if err != nil {
 		return "", err
 	}
@@ -514,34 +1107,41 @@ func (s *session) PropertyGet(name string, depth int) (string, error) {
 }
 
 func (s *session) PropertySet(name, value string) (string, error) {
+	if strings.ContainsRune(name, 0) {
+		return "", fmt.Errorf("name must not contain NUL")
+	}
 	enc := base64.StdEncoding.EncodeToString([]byte(value))
-	if _, _, err := s.cmd("property_set", fmt.Sprintf("-n %s -- %s", name, enc)); err != nil {
+	r, _, err := s.cmd("property_set", fmt.Sprintf("-n %s -- %s", quoteArg(name), enc))
+	if err != nil {
 		return "", err
+	}
+	if r.Success == "0" {
+		return "", fmt.Errorf("property_set failed: success=\"0\"")
 	}
 	return fmt.Sprintf("%s = %s", name, value), nil
 }
 
+// controlTimeout bounds the best-effort detach/stop command so Detach/Stop
+// return even when a run is pending and the engine is not reading commands.
+const controlTimeout = 500 * time.Millisecond
+
 func (s *session) Detach() (string, error) {
-	s.cmd("detach", "") //nolint:errcheck // best-effort detach
+	if _, _, err := s.cmdWithin("detach", "", controlTimeout); err != nil {
+		log.Printf("detach: %v", err) // best-effort: the engine may be mid-run
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.conn != nil {
-		s.conn.Close()
-		s.conn = nil
-	}
-	s.state = "no session"
+	s.dropLocked()
 	return "detached", nil
 }
 
 func (s *session) Stop() (string, error) {
-	s.cmd("stop", "") //nolint:errcheck // best-effort stop
+	if _, _, err := s.cmdWithin("stop", "", controlTimeout); err != nil {
+		log.Printf("stop: %v", err) // best-effort: the engine may be mid-run
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.conn != nil {
-		s.conn.Close()
-		s.conn = nil
-	}
-	s.state = "no session"
+	s.dropLocked()
 	return "stopped", nil
 }
 
@@ -576,6 +1176,199 @@ func (s *session) runShell(cmd string) (string, error) {
 	return text, nil
 }
 
+// --- waiting for a connection ----------------------------------------------
+
+// waitForSession blocks until adopt finishes (ready) or the engine fails to
+// connect. acceptResult carries the listener's Accept error (nil once a
+// connection was accepted, before the handshake). interrupt, when non-nil,
+// carries a failure of the triggering request or command. On success it returns
+// nil; otherwise it returns the handshake error or a timeout error. It always
+// closes the listener before returning, so a later listen never sees a stale
+// listener, and it never leaves an orphan paused session behind.
+func (s *session) waitForSession(ready <-chan struct{}, acceptResult <-chan error, interrupt <-chan error, timeout time.Duration, noEngineFmt string) error {
+	err := s.awaitOutcome(ready, acceptResult, interrupt, timeout, noEngineFmt)
+	s.closeLn()
+	return err
+}
+
+func (s *session) awaitOutcome(ready <-chan struct{}, acceptResult <-chan error, interrupt <-chan error, timeout time.Duration, noEngineFmt string) error {
+	select {
+	case <-ready:
+		return s.handshakeError()
+	case err := <-acceptResult:
+		if err != nil {
+			return fmt.Errorf(noEngineFmt, timeout)
+		}
+		return s.awaitHandshake(ready)
+	case err := <-interrupt:
+		return s.requestErrorUnlessReady(ready, acceptResult, err)
+	}
+}
+
+// waitForCommand waits for a debug session like waitForSession but also watches
+// the container command. When the command exits before Xdebug connects, it
+// returns promptly with the command output and exit status instead of waiting
+// for the whole timeout, and it always closes the listener before returning.
+func (s *session) waitForCommand(ready <-chan struct{}, acceptResult <-chan error, resultCh <-chan commandResult, timeout time.Duration, noEngineFmt string) error {
+	err := s.awaitCommand(ready, acceptResult, resultCh, timeout, noEngineFmt)
+	s.closeLn()
+	return err
+}
+
+func (s *session) awaitCommand(ready <-chan struct{}, acceptResult <-chan error, resultCh <-chan commandResult, timeout time.Duration, noEngineFmt string) error {
+	select {
+	case <-ready:
+		return s.handshakeError()
+	case err := <-acceptResult:
+		if err != nil {
+			return fmt.Errorf(noEngineFmt, timeout)
+		}
+		return s.awaitHandshake(ready)
+	case res := <-resultCh:
+		return s.awaitCommandExit(ready, acceptResult, res)
+	}
+}
+
+// awaitCommandExit is called when the container command exits before an engine
+// connected. It grants commandExitGrace for an engine that connected just before
+// the exit, then reports the command's own outcome: a command failure with its
+// output and exit status, or a success without Xdebug with the output.
+func (s *session) awaitCommandExit(ready <-chan struct{}, acceptResult <-chan error, res commandResult) error {
+	select {
+	case <-ready:
+		return s.handshakeError()
+	case err := <-acceptResult:
+		if err == nil {
+			return s.awaitHandshake(ready)
+		}
+		// Accept failed (deadline or listener close): no engine connected.
+		return commandOutcomeError(res)
+	case <-time.After(commandExitGrace):
+	}
+	// The grace expired, but a connection accepted right at the boundary may
+	// still be adopted after this returns — the orphan-session failure #27
+	// fixed for the other paths. Settle the accept goroutine first so no path
+	// reports the command error while a live session remains.
+	connected, err := s.settleAccepted(ready, acceptResult)
+	if err != nil {
+		return err
+	}
+	if connected {
+		// A session was adopted: let RunCommand's existing post-wait state
+		// handling collect the command output or report the paused session.
+		return nil
+	}
+	return commandOutcomeError(res)
+}
+
+// settleAccepted closes the listener and waits for the accept goroutine to
+// report its final verdict, so a connection accepted at the commandExitGrace
+// boundary cannot be adopted after the caller has given up. It reports whether
+// a session was established: connected is true when adopt succeeded (a live or
+// already-completed session the caller must report instead of the command
+// error), err is the handshake error when adopt failed, and both false/nil mean
+// no engine connected.
+func (s *session) settleAccepted(ready <-chan struct{}, acceptResult <-chan error) (connected bool, err error) {
+	// Close the listener if no handshake is in progress, so a pending Accept
+	// reports instead of returning a connection after we have decided. Do not
+	// block on s.mu: adopt may hold it for the whole handshake, and a stuck
+	// boundary engine must not delay the result. When adopt holds s.mu a
+	// connection was already accepted, so acceptResult reports it below.
+	s.closeLnIfIdle()
+	select {
+	case <-ready:
+		return s.adoptedSession()
+	case err := <-acceptResult:
+		if err == nil {
+			if herr := s.awaitHandshake(ready); herr != nil {
+				return false, herr
+			}
+			return true, nil
+		}
+		return false, nil
+	case <-time.After(commandExitGrace):
+		// The accept goroutine did not report in time; drop anything it
+		// accepted, then keep a session that finished adopting meanwhile.
+		s.dropOrphan(ready)
+		select {
+		case <-ready:
+			return s.adoptedSession()
+		default:
+		}
+		return false, nil
+	}
+}
+
+// closeLnIfIdle closes the active listener when no handshake is in progress,
+// without blocking on s.mu. It is a best-effort close: when adopt holds s.mu a
+// connection was already accepted and there is nothing to unblock.
+func (s *session) closeLnIfIdle() {
+	if !s.mu.TryLock() {
+		return
+	}
+	defer s.mu.Unlock()
+	if s.ln != nil {
+		s.ln.Close()
+		s.ln = nil
+	}
+}
+
+// adoptedSession reports the outcome of an adopt that has finished (ready
+// closed). connected is true when the handshake succeeded — a session was
+// established, even if a breakpoint-less script already ran to completion —
+// and err is the handshake error when it failed.
+func (s *session) adoptedSession() (connected bool, err error) {
+	if herr := s.handshakeError(); herr != nil {
+		return false, herr
+	}
+	return true, nil
+}
+
+// commandOutcomeError turns the command's own result into the error RunCommand
+// returns when no Xdebug connection arrived.
+func commandOutcomeError(res commandResult) error {
+	if res.err != nil {
+		return fmt.Errorf("command exited before Xdebug connected: %s: %w", res.out, res.err)
+	}
+	return fmt.Errorf("command finished without an Xdebug connection — is Xdebug enabled in the container? output: %s", res.out)
+}
+
+// awaitHandshake waits for adopt to finish after Xdebug connected. adopt bounds
+// the handshake with handshakeTimeout, so this wait is bounded too; the grace
+// only covers scheduler delay. If adopt still has not finished, the accepted
+// connection is dropped so no orphan paused session remains.
+func (s *session) awaitHandshake(ready <-chan struct{}) error {
+	select {
+	case <-ready:
+		return s.handshakeError()
+	case <-time.After(handshakeTimeout + handshakeGrace):
+		s.dropOrphan(ready)
+		return fmt.Errorf("xdebug connected but the DBGp handshake did not finish within %s", handshakeTimeout)
+	}
+}
+
+// dropOrphan drops a connection adopt is still handshaking so a caller timeout
+// cannot leave a paused session the client does not know about. It keeps the
+// session when adopt finished in the meantime. The ready check runs under mu,
+// which adopt holds for the whole handshake, so adopt cannot finish between the
+// check and the drop.
+func (s *session) dropOrphan(ready <-chan struct{}) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	select {
+	case <-ready:
+		return
+	default:
+	}
+	if s.acceptedConn != nil {
+		s.acceptedConn.Close()
+		s.acceptedConn = nil
+	}
+	if s.conn != nil {
+		s.dropLocked()
+	}
+}
+
 // ListenWait opens the DBGp port, blocks until the next engine connection is
 // adopted, then closes the port. Use for CLI/Symfony commands launched separately.
 func (s *session) ListenWait(timeout time.Duration) (string, error) {
@@ -583,20 +1376,14 @@ func (s *session) ListenWait(timeout time.Duration) (string, error) {
 	ready := s.ready
 	s.mu.Unlock()
 
-	if err := s.openOnce(timeout, 10*time.Second); err != nil {
+	acceptResult, err := s.openOnce(timeout, 10*time.Second)
+	if err != nil {
 		return "", err
 	}
-
-	select {
-	case <-ready:
-		if err := s.handshakeError(); err != nil {
-			return "", err
-		}
-		return s.Status(), nil
-	case <-time.After(timeout):
-		s.closeLn()
-		return "", fmt.Errorf("no engine connected within %s", timeout)
+	if err := s.waitForSession(ready, acceptResult, nil, timeout, "no engine connected within %s"); err != nil {
+		return "", err
 	}
+	return s.Status(), nil
 }
 
 // ListenFireForget opens the DBGp port and returns immediately — the listener
@@ -607,7 +1394,7 @@ func (s *session) ListenWait(timeout time.Duration) (string, error) {
 func (s *session) ListenFireForget() (string, error) {
 	// We don't know the accept timeout here — use a long default (1h) so the
 	// listener stays open. It is closed right after the first accept, before adopt() runs.
-	if err := s.openOnce(time.Hour, 10*time.Second); err != nil {
+	if _, err := s.openOnce(time.Hour, 10*time.Second); err != nil {
 		return "", err
 	}
 	return "listener armed (fire-and-forget); check status to see if a session was adopted", nil
@@ -634,22 +1421,19 @@ func (s *session) RunCommand(command string, timeout time.Duration) (string, err
 	ready := s.ready
 	s.mu.Unlock()
 
-	if err := s.openOnce(timeout, 10*time.Second); err != nil {
+	acceptResult, err := s.openOnce(timeout, 10*time.Second)
+	if err != nil {
 		return "", err
 	}
 
-	type cmdResult struct {
-		out string
-		err error
-	}
-	resultCh := make(chan cmdResult, 1)
+	resultCh := make(chan commandResult, 1)
 
 	go func() {
 		fullCmd := s.containerExec + " " + command
 		c := exec.Command("sh", "-c", fullCmd)
 		c.Dir = s.projectDir
 		out, err := c.CombinedOutput()
-		resultCh <- cmdResult{strings.TrimSpace(string(out)), err}
+		resultCh <- commandResult{strings.TrimSpace(string(out)), err}
 		if err != nil {
 			log.Printf("command error: %v", err)
 		} else {
@@ -657,32 +1441,26 @@ func (s *session) RunCommand(command string, timeout time.Duration) (string, err
 		}
 	}()
 
-	select {
-	case <-ready:
-		if err := s.handshakeError(); err != nil {
-			return "", err
-		}
-		s.mu.Lock()
-		state := s.state
-		s.mu.Unlock()
-		if state == "stopping" || state == "no session" {
-			// Script ran to completion — collect command output.
-			select {
-			case r := <-resultCh:
-				if r.err != nil {
-					return r.out, fmt.Errorf("%s: %w", r.out, r.err)
-				}
-				if r.out != "" {
-					return r.out, nil
-				}
-				return "command completed", nil
-			case <-time.After(5 * time.Second):
-				return "script ran to completion (command output not captured in time)", nil
-			}
-		}
-		return "command fired; session paused at script start — call run/step to drive", nil
-	case <-time.After(timeout):
-		s.closeLn()
-		return "", fmt.Errorf("no Xdebug connection within %s — is Xdebug enabled in the container? (docker compose exec php set-xdebug-on)", timeout)
+	if err := s.waitForCommand(ready, acceptResult, resultCh, timeout, "no Xdebug connection within %s — is Xdebug enabled in the container? (docker compose exec php set-xdebug-on)"); err != nil {
+		return "", err
 	}
+	s.mu.Lock()
+	state := s.state
+	s.mu.Unlock()
+	if state == "stopping" || state == "no session" {
+		// Script ran to completion — collect command output.
+		select {
+		case r := <-resultCh:
+			if r.err != nil {
+				return r.out, fmt.Errorf("%s: %w", r.out, r.err)
+			}
+			if r.out != "" {
+				return r.out, nil
+			}
+			return "command completed", nil
+		case <-time.After(5 * time.Second):
+			return "script ran to completion (command output not captured in time)", nil
+		}
+	}
+	return "command fired; session paused at script start — call run/step to drive", nil
 }

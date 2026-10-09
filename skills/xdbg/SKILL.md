@@ -12,6 +12,10 @@ This project uses **xdbg** (an MCP server) to debug PHP inside Docker. You
 have access to xdbg tools via MCP. Do not ask the user to run Docker commands
 manually unless the MCP tools fail — the agent can drive the entire session.
 
+Tool names in this guide are the short MCP names. Your client can show them
+with a prefix, for example `xdbg_status` (opencode) or `mcp__xdbg__status`
+(Claude Code).
+
 ## Which flow to use? — Decision Tree
 
 | User wants to debug... | Pick flow |
@@ -95,7 +99,7 @@ Never paste tokens into tool arguments. Use `request_from_files`:
 
 ## Flow 2: Debugging a CLI Command (agent-driven — `run_command`)
 
-Best for: Symfony console commands, artisan commands, or any CLI entrypoint reachable via `docker compose exec -T php <command>`.
+Best for: Symfony console commands, artisan commands, or any CLI entrypoint that runs with the `--container-exec` prefix (default `docker compose exec -T php`) followed by `<command>`.
 
 ### Example — Symfony console command
 
@@ -175,6 +179,21 @@ Set `timeoutMs` generously for `listen` (e.g. 60000 or 120000). The user may nee
 
 ---
 
+## Paths and Property Names
+
+Breakpoint paths and property names support spaces and non-ASCII characters.
+Pass the original path to `set_breakpoint`, for example `{file: "my dir/a b.php", line: 3}`.
+Do not percent-encode the path or add DBGp quotes.
+xdbg encodes file URIs and shows decoded host paths in locations and stacks.
+Plain paths retain literal percent sequences, such as `%20` in a filename.
+
+Use `property_get` with `{name: "$arr['a b']"}` to read an array entry with a space in its key.
+Use `property_set` with `{name: "$arr['a b']", value: "99"}` to change that entry.
+xdbg escapes quotes and backslashes in property names for DBGp.
+Property names must not contain NUL bytes.
+
+---
+
 ## Common Failure Modes & Recovery
 
 | Symptom | Likely cause | Fix |
@@ -182,7 +201,7 @@ Set `timeoutMs` generously for `listen` (e.g. 60000 or 120000). The user may nee
 | `request` returns `(script finished)` immediately | Breakpoint not hit | Wrong line, wrong file, Xdebug off, or route mismatch. Check `breakpoint_list` and `container_status`. |
 | `run_command` returns `(script finished)` | Breakpoint not hit, or command has no Xdebug trigger | Same as above. Try `listen` + manual launch to verify the command actually runs the code. |
 | `status` shows `no session` after `listen` | Engine never connected | Xdebug off, wrong container, network issue. Ask user to verify `php -i \| grep xdebug.mode` inside the container. |
-| `request` / `run_command` error: "session already active" | Stale session from previous run | `detach` or `stop` first. Always check `status` before starting a new session. |
+| `request` / `run_command` error: "debug session already active — call detach or stop first" | Stale session from previous run | `detach` or `stop` first. Always check `status` before starting a new session. |
 | `step_into` behaves like `step_over` | No function call on current line, or function is internal/native | Normal. Use `step_over` or `run` instead. |
 | Variables show `object {3 children}` | Nested objects are collapsed | Use `property_get('$variable')` or `property_get('$variable->property')` to drill in. |
 | `eval` returns an error | Expression throws an exception or uses undefined variable | Check `context` first to see what's in scope. Try simpler expressions. |
@@ -201,6 +220,11 @@ Set `timeoutMs` generously for `listen` (e.g. 60000 or 120000). The user may nee
 | *"What's in $user here?"* | `context` or `property_get('$user')` or `eval('$user->getRoles()')` |
 | *"Step into this function"* | `step_into` |
 | *"Let it run to the next breakpoint"* | `run` |
+| *"Run until this function returns"* | `step_out` |
+| *"Set $limit to 5 and go on"* | `property_set('$limit', '5')` → `run` |
+| *"It is stuck in a loop, stop there"* | `pause` (it cannot interrupt a running `run` yet, see #25) |
+| *"Remove that breakpoint"* | `breakpoint_list` → `breakpoint_remove('<id>')` |
+| *"Remove all breakpoints"* | `breakpoint_clear` |
 | *"I'm done debugging"* | `detach` or `stop` → `container_disable` (optional) |
 | *"Why didn't it break?"* | Check `container_status`, `breakpoint_list`, verify file path and line number. Try `listen` + manual launch to test connectivity. |
 | *"The port is busy"* | Ask user to close PhpStorm/browser debugger, or run `lsof -i :9003` and kill the process. |
@@ -215,4 +239,4 @@ Always clean up to leave port 9003 free and container performance restored:
 2. `container_disable` — turns Xdebug off (optional but recommended)
 3. `status` — confirm `no session` and port is free
 
-> **Note:** If you forget `detach`/`stop`, the next `request` or `run_command` will fail with "session already active". Always check `status` before starting a new session.
+> **Note:** If you forget `detach`/`stop`, the next `request` or `run_command` will fail with "debug session already active — call detach or stop first". Always check `status` before starting a new session.

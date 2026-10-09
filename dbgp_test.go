@@ -5,7 +5,27 @@ import (
 	"encoding/base64"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
+
+func TestQuoteArg(t *testing.T) {
+	for _, tc := range []struct{ name, in, want string }{
+		{"empty", "", `""`},
+		{"variable", "$x", `"$x"`},
+		{"spaces", "$arr['a b']", `"$arr['a b']"`},
+		{"double quotes", `$a["k"]`, `"$a[\"k\"]"`},
+		{"backslash", `a\b`, `"a\\b"`},
+		{"quotes and backslash", `$a["a\b"]`, `"$a[\"a\\b\"]"`},
+		{"trailing backslash", `a\`, `"a\\"`},
+		{"non-ASCII", "$arr['żółć']", `"$arr['żółć']"`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := quoteArg(tc.in); got != tc.want {
+				t.Fatalf("quoteArg(%q) = %q; want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
 
 // --- DBGp packet framing (readPacket) ---------------------------------------
 
@@ -114,6 +134,29 @@ func TestUnmarshalResponseFields(t *testing.T) {
 	}
 }
 
+func TestXRespError(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		resp *xResp
+		want string
+	}{
+		{"nil response", nil, ""},
+		{"no engine error", &xResp{}, ""},
+		{"engine error", &xResp{Error: &xErr{Code: "300", Message: " \ncan not get property\t "}}, "property_get error 300: can not get property"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := tc.resp.err("property_get")
+			if tc.want == "" {
+				if err != nil {
+					t.Fatalf("err = %v, want nil", err)
+				}
+			} else if err == nil || err.Error() != tc.want {
+				t.Fatalf("err = %v, want %q", err, tc.want)
+			}
+		})
+	}
+}
+
 func TestUnmarshalDeclaredLatin1Charset(t *testing.T) {
 	// The DBGp engine declares iso-8859-1; the identity charset reader must accept it.
 	var r xResp
@@ -170,9 +213,56 @@ func TestDecodeValInvalidBase64FallsBack(t *testing.T) {
 // --- one-line rendering (summarize) -----------------------------------------
 
 func TestSummarizeChildren(t *testing.T) {
-	p := xProp{Type: "array", Children: []xProp{{}, {}, {}}}
-	if got := summarize(p); got != "array {3 children}" {
-		t.Fatalf("summarize = %q", got)
+	for _, tc := range []struct{ name, xml, want string }{
+		{
+			"real numchildren exceeds the received page",
+			`<property name="$arr" type="array" children="1" numchildren="300" page="0" pagesize="100">` +
+				`<property name="0" type="int"><![CDATA[1]]></property>` +
+				`<property name="1" type="int"><![CDATA[2]]></property>` +
+				`</property>`,
+			"array {300 children}",
+		},
+		{
+			"empty array",
+			`<property name="$arr" type="array" children="0" numchildren="0"></property>`,
+			"array {0 children}",
+		},
+		{
+			"object at the depth limit without child elements",
+			`<property name="$obj" type="object" children="1" numchildren="5"></property>`,
+			"object {5 children}",
+		},
+		{
+			"array without numchildren falls back to the received count",
+			`<property name="$arr" type="array">` +
+				`<property name="0" type="int"><![CDATA[1]]></property>` +
+				`<property name="1" type="int"><![CDATA[2]]></property>` +
+				`</property>`,
+			"array {2 children}",
+		},
+		{
+			"scalar int",
+			`<property name="$i" type="int"><![CDATA[7]]></property>`,
+			"7",
+		},
+		{
+			"base64 string",
+			`<property name="$s" type="string" encoding="base64"><![CDATA[aGk=]]></property>`,
+			"hi",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var r xResp
+			if err := unmarshal(xmlProlog+`<response command="context_get" status="break">`+tc.xml+`</response>`, &r); err != nil {
+				t.Fatalf("unmarshal: %v", err)
+			}
+			if len(r.Props) != 1 {
+				t.Fatalf("props = %+v, want exactly one", r.Props)
+			}
+			if got := summarize(r.Props[0]); got != tc.want {
+				t.Fatalf("summarize = %q, want %q", got, tc.want)
+			}
+		})
 	}
 }
 
@@ -187,5 +277,19 @@ func TestSummarizeTruncatesLongValue(t *testing.T) {
 	got := summarize(xProp{Type: "string", Value: long})
 	if len([]rune(got)) != 301 || !strings.HasSuffix(got, "…") {
 		t.Fatalf("summarize length = %d, want 301 ending in an ellipsis", len([]rune(got)))
+	}
+}
+
+func TestSummarizeTruncatesLongUTF8Value(t *testing.T) {
+	long := "a" + strings.Repeat("é", 350)
+	got := summarize(xProp{Type: "string", Value: long})
+	if !utf8.ValidString(got) {
+		t.Fatalf("summarize = %q, want valid UTF-8", got)
+	}
+	if n := utf8.RuneCountInString(got); n != 301 {
+		t.Fatalf("summarize length = %d, want 301 runes", n)
+	}
+	if want := "a" + strings.Repeat("é", 299) + "…"; got != want {
+		t.Fatalf("summarize = %q, want %q", got, want)
 	}
 }
